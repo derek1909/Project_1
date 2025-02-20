@@ -17,6 +17,27 @@ class Lossfunc(object):
     def __call__(self, pred_stress, target_stress):
         return self.mse_loss(pred_stress, target_stress)
 
+# Temporal Loss Function
+class TemporalLossFunc(object):
+    def __init__(self):
+        # We'll use the MSE loss for each time step.
+        self.mse_loss = nn.MSELoss(reduction='mean')
+
+    def __call__(self, pred_stress, target_stress):
+        """
+        Compute the loss as the average MSE over all time steps.
+        Both pred_stress and target_stress should have shape [batch, T, output_dim].
+        """
+        T = pred_stress.shape[1]
+        total_loss = 0.0
+        for t in range(T):
+            # Compute loss for time step t
+            loss_t = self.mse_loss(pred_stress[:, t, :], target_stress[:, t, :])
+            total_loss += loss_t
+        # Average loss over time steps
+        return total_loss / T
+
+
 # This reads the matlab data from the .mat file provided
 class MatRead(object):
     def __init__(self, file_path):
@@ -97,21 +118,74 @@ class Const_Net(nn.Module):
         out = decoded.view(batch_size, nstep, -1)
         return out
 
+# RNN Architecture for Constitutive Modeling
+class Const_RNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, output_dim=None):
+        """
+        Args:
+            input_dim: Dimension of the input (e.g., number of strain components).
+            hidden_dim: Dimension of the hidden state (represents the memory capacity).
+            output_dim: Dimension of the output (e.g., number of stress components).
+        """
+        super(Const_RNN, self).__init__()
+        self.hidden_dim = hidden_dim
+        
+        # f: Function to update the hidden state.
+        # It takes the concatenation of the current input and previous hidden state.
+        self.f = nn.Sequential(
+            nn.Linear(input_dim + hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # g: Function to compute the output (predicted stress) from the current input and hidden state.
+        self.g = nn.Sequential(
+            nn.Linear(input_dim + hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        """
+        Forward pass for a sequence of inputs.
+        Args:
+            x: Input tensor of shape [batch, T, input_dim] where T is the number of time steps.
+        Returns:
+            outputs: Output tensor of shape [batch, T, output_dim] (predicted stress over time).
+        """
+        batch_size, T, _ = x.shape
+        # Initialize hidden state as zeros
+        h = torch.zeros(batch_size, self.hidden_dim, device=x.device)
+        outputs = []
+        
+        # Process each time step sequentially
+        for t in range(T):
+            x_t = x[:, t, :]  # current input at time step t, shape [batch, input_dim]
+            # Update hidden state with a residual update (similar to forward Euler discretization)
+            h = h + self.f(torch.cat([x_t, h], dim=1))
+            # Compute the output at current time step
+            y_t = self.g(torch.cat([x_t, h], dim=1))
+            outputs.append(y_t.unsqueeze(1))  # Add time dimension
+            
+        # Concatenate the outputs along the time dimension
+        outputs = torch.cat(outputs, dim=1)
+        return outputs
+    
 ######################### Experiment Loop #########################
 # List of material files (assumed to be in Problem_1_student/Data/)
-material_files = ['Material_A.mat', 'Material_B.mat', 'Material_C.mat']
-# material_files = ['Material_C.mat']
+# material_files = ['Material_A.mat', 'Material_B.mat', 'Material_C.mat']
+material_files = ['Material_C.mat']
 
 # Hyperparameters (you can experiment with these and comment in your report)
 learning_rate = 3e-5
-hidden_dim = 64
-epochs = 300
-sche_step_size = 20
+hidden_dim = 128
+epochs = 500
+sche_step_size = 50
 batch_size = 20
 
 # Base folders for data and results
 data_folder = 'Problem_1_student/Data'
-results_base = 'Problem_1_student/results/OutputStress'
+results_base = 'Problem_1_student/results/RNNOutputStress'
 os.makedirs(results_base, exist_ok=True)
 
 for material_file in material_files:
@@ -157,10 +231,11 @@ for material_file in material_files:
     train_loader = Data.DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
     # Initialize the network, loss function, optimizer, and scheduler
-    net = Const_Net(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim)
+    net = Const_RNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim)
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"Number of parameters for {material_name}: {n_params}")
 
+    # loss_func = TemporalLossFunc()
     loss_func = Lossfunc()
     optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=sche_step_size, gamma=0.5)
