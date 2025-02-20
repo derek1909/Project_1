@@ -4,11 +4,26 @@ import torch.nn as nn
 import torch.utils.data as Data
 import numpy as np
 import h5py
+import ipdb
 
 # Define your loss function here
 class Lossfunc(object):
-    def 
+    def __init__(self):
+        # Create an instance of the MSE loss function from PyTorch
+        self.mse_loss = nn.MSELoss()
 
+    def __call__(self, pred_stress, target_stress):
+        """
+        Compute the MSE loss between predicted stress and target stress.
+        
+        Parameters:
+            pred_stress (torch.Tensor): Predicted stress values.
+            target_stress (torch.Tensor): Ground truth stress values.
+        
+        Returns:
+            torch.Tensor: Computed MSE loss.
+        """
+        return self.mse_loss(pred_stress, target_stress)
 
 # This reads the matlab data from the .mat file provided
 class MatRead(object):
@@ -28,33 +43,121 @@ class MatRead(object):
 
 # Define data normalizer
 class DataNormalizer(object):
+    def __init__(self, data):
+        # Flatten the first two dimensions so that each row corresponds to a single sample at one time step.
+        data_flat = data.reshape(-1, data.shape[-1])
+        self.mean = data_flat.mean(axis=0)
+        self.std = data_flat.std(axis=0)
+        # Avoid division by zero in case a feature has zero variance.
+        self.std[self.std == 0] = 1.0
+
+    def transform(self, data):
+        """
+        Standardize the data using the computed mean and std.
+        Parameters:
+            data (np.ndarray): Data array of shape (n_samples, n_steps, n_features)
+        Returns:
+            np.ndarray: Normalized data of the same shape as input.
+        """
+        if self.mean is None or self.std is None:
+            raise ValueError("The normalizer must be fitted before calling transform.")
+        return (data - self.mean) / self.std
+
+    def inverse_transform(self, data_normalized):
+        """
+        Revert the standardization to get the original data.
+        Parameters:
+            data_normalized (np.ndarray): Normalized data array.
+        Returns:
+            np.ndarray: Original data recovered from the normalized data.
+        """
+        if self.mean is None or self.std is None:
+            raise ValueError("The normalizer must be fitted before calling inverse_transform.")
+        return data_normalized * self.std + self.mean
 
 # Define network your neural network for the constitutive model below
+import torch
+import torch.nn as nn
+
 class Const_Net(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, output_dim=None):
+        """
+        Args:
+            input_dim (int): Number of input features (ndim).
+            hidden_dim (int): Size of the hidden layers.
+            output_dim (int, optional): Number of output features.
+                                        If None, set equal to input_dim.
+        """
+        super(Const_Net, self).__init__()
+        if output_dim is None:
+            output_dim = input_dim
+
+        # Encoder: maps the input strain to a latent representation
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+        # Decoder: maps the latent representation to predicted stress
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        """
+        Forward pass through the network.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, nstep, input_dim)
+        
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, nstep, output_dim)
+        """
+        batch_size, nstep, input_dim = x.shape
+        # Flatten the time dimension with the batch dimension so that each time step is processed individually.
+        x_flat = x.view(batch_size * nstep, input_dim)
+        # Encode the flattened input
+        encoded = self.encoder(x_flat)
+        # Decode the latent representation
+        decoded = self.decoder(encoded)
+        # Reshape back to (batch_size, nstep, output_dim)
+        out = decoded.view(batch_size, nstep, -1)
+        return out
 
 ######################### Data processing #############################
 # Read data from .mat file
-path = './Data/Material_A.mat' #Define your data path here
+path = 'Problem_1_student/Data/Material_A.mat' #Define your data path here
 data_reader = MatRead(path)
 strain = data_reader.get_strain()
 stress = data_reader.get_stress()
 
 # Split data into train and test
-ntrain =  # Specify the training data
-ntest =   # Specify the test data
-train_strain =
-train_stress =
-test_strain =
-test_stress =
+n_samples = strain.shape[0]
+ntrain = int(0.8 * n_samples)
+ntest = n_samples - ntrain
+
+# Apply the permutation
+perm = torch.randperm(n_samples)
+strain = strain[perm]
+stress = stress[perm]
+
+train_strain = strain[:ntrain]
+train_stress = stress[:ntrain]
+test_strain  = strain[ntrain:]
+test_stress  = stress[ntrain:]
 
 # Normalize your data
-strain_normalizer   =
-train_strain_encode =   # this should be the data after normalization
-test_strain_encode  =
+strain_normalizer   = DataNormalizer(train_strain)
+train_strain_encode = strain_normalizer.transform(train_strain)
+test_strain_encode  = strain_normalizer.transform(test_strain)
 
-stress_normalizer   =
-train_stress_encode =
-test_stress_encode  =
+stress_normalizer   = DataNormalizer(train_stress)
+train_stress_encode = stress_normalizer.transform(train_stress)
+test_stress_encode  = stress_normalizer.transform(test_stress)
 
 ndim = strain.shape[2]  # Number of components
 nstep = strain.shape[1] # Number of time steps
@@ -67,56 +170,62 @@ train_loader = Data.DataLoader(train_set, batch_size, shuffle=True)
 
 ############################# Define and train network #############################
 # Create Nueral network, define loss function and optimizer
-net = Const_Net()   # specify your neural network architecture
+net = Const_Net(input_dim=ndim, hidden_dim=64, output_dim=ndim)
 
 n_params = sum(p.numel() for p in net.parameters() if p.requires_grad) #Calculate the number of training parameters
 print('Number of parameters: %d' % n_params)
 
-loss_func = Lossfunc() #define loss function
-optimizer =  # define optimizer
-scheduler =  # define scheduler
+loss_func = Lossfunc() # define loss function
+optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)  # define optimizer with learning rate 0.001
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)  # decrease LR by half every 20 epochs
 
 # Train network
-epochs =    # define number of training epochs
+epochs = 100  # define number of training epochs
 print("Start training for {} epochs...".format(epochs))
 
 loss_train_list = []
 loss_test_list = []
 
+# (Assuming you have already defined train_loader and test_loader)
 for epoch in range(epochs):
     net.train(True)
-    trainloss = 0
-
-
+    trainloss = 0.0
     for i, data in enumerate(train_loader):
         input, target = data
+        # batch_size, nstep, input_dim = inputs.shape
+
         #define forward neural network evaluation below
-        output_encode = # Forward
-        output        = # Decode output
-        loss = loss_func() # Calculate loss
+        output = net(input)
+        loss = loss_func(output, target)
 
-                             # Clear gradients
-                             # Backward
-                             # Update parameters
-                             # Update learning rate
+        # Clear gradients, backpropagate, and update parameters
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()  # update learning rate if required per batch
+        
+        # Accumulate the training loss
+        trainloss += loss.item()
+    trainloss /= len(train_loader)
 
-        trainloss +=         # update your train loss here
-
-    # Compute your test loss below
+    # Compute test loss
     net.eval()
+    testloss = 0.0
     with torch.no_grad():
+        output_test = net(test_strain_encode)
+        testloss = loss_func(output_test, test_stress_encode)
 
     # Print train loss every 10 epochs
     if epoch % 10 == 0:
-        print("epoch:{}, train loss:{}, test loss:{}".format(epoch, trainloss/len(train_loader), testloss))
-
-    # Save loss
-    loss_train_list.append(trainloss/len(train_loader))
+        print("epoch: {}, train loss: {:.4f}, test loss: {:.4f}".format(epoch,
+                                                                         trainloss / len(train_loader),
+                                                                         testloss))
+    # Save loss values for plotting later
+    loss_train_list.append(trainloss / len(train_loader))
     loss_test_list.append(testloss)
 
-
-print("Train loss:{}".format(trainloss/len(train_loader)))
-print("Test loss:{}".format(testloss))
+print("Final Train loss: {:.4f}".format(trainloss / len(train_loader)))
+print("Final Test loss: {:.4f}".format(testloss))
 
 ############################# Plot your result below using Matplotlib #############################
 plt.figure(1)
