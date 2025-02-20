@@ -8,6 +8,10 @@ import h5py
 import ipdb
 import yaml  # For logging training history to a YAML file
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cpu")
+print("Using device:", device)
+
 ######################### Utility Classes #########################
 # Loss function using MSE of stress
 class Lossfunc(object):
@@ -134,16 +138,19 @@ class Const_RNN(nn.Module):
         # It takes the concatenation of the current input and previous hidden state.
         self.f = nn.Sequential(
             nn.Linear(input_dim + hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
         # g: Function to compute the output (predicted stress) from the current input and hidden state.
         self.g = nn.Sequential(
             nn.Linear(input_dim + hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, output_dim)
         )
+
 
     def forward(self, x):
         """
@@ -177,11 +184,11 @@ class Const_RNN(nn.Module):
 material_files = ['Material_C.mat']
 
 # Hyperparameters (you can experiment with these and comment in your report)
-learning_rate = 3e-5
-hidden_dim = 128
+learning_rate = 3e-4
+hidden_dim = 256
 epochs = 500
-sche_step_size = 50
-batch_size = 20
+sche_step_size = 125
+batch_size = 50
 
 # Base folders for data and results
 data_folder = 'Problem_1_student/Data'
@@ -231,7 +238,8 @@ for material_file in material_files:
     train_loader = Data.DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
     # Initialize the network, loss function, optimizer, and scheduler
-    net = Const_RNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim)
+    # net = Const_RNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim)
+    net = Const_RNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim).to(device)  
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"Number of parameters for {material_name}: {n_params}")
 
@@ -249,6 +257,8 @@ for material_file in material_files:
         trainloss = 0.0
         for i, data in enumerate(train_loader):
             inputs, targets = data
+            inputs = inputs.to(device)
+            targets = targets.to(device)
             output = net(inputs)
             loss = loss_func(output, targets)
 
@@ -263,6 +273,8 @@ for material_file in material_files:
         # Compute test loss
         net.eval()
         with torch.no_grad():
+            test_strain_encode = test_strain_encode.to(device)
+            test_stress_encode = test_stress_encode.to(device)
             output_test = net(test_strain_encode)
             testloss = loss_func(output_test, test_stress_encode).item()
         loss_test_list.append(testloss)
@@ -310,7 +322,9 @@ for material_file in material_files:
         # Use the first sample from the test set
         sample_input = test_strain_encode[0:1]
         sample_target = test_stress_encode[0:1]
+        sample_input = sample_input.to(device)  # Ensure sample is on GPU for inference
         sample_output = net(sample_input)
+        sample_output = sample_output.cpu().numpy()
     time_steps = np.linspace(0, dt*(nstep-1), nstep)
     plt.figure(figsize=(8, 5))
 
@@ -323,7 +337,7 @@ for material_file in material_files:
         plt.plot(time_steps, sample_target[0, :, comp].cpu().numpy(), 
                 label=f'Truth Stress comp {comp}', color=color)
         # Plot predicted stress in dashed line using the same color
-        plt.plot(time_steps, sample_output[0, :, comp].cpu().numpy(), '--', 
+        plt.plot(time_steps, sample_output[0, :, comp], '--', 
                 label=f'Predicted Stress comp {comp}', color=color)
 
     plt.xlabel('Time')
