@@ -5,6 +5,7 @@ import torch.utils.data as Data
 import numpy as np
 import h5py
 import ipdb
+import yaml  # For logging training history to a YAML file
 
 # Define your loss function here
 class Lossfunc(object):
@@ -76,9 +77,6 @@ class DataNormalizer(object):
         return data_normalized * self.std + self.mean
 
 # Define network your neural network for the constitutive model below
-import torch
-import torch.nn as nn
-
 class Const_Net(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, output_dim=None):
         """
@@ -165,36 +163,34 @@ dt = 1/(nstep-1)
 
 # Create data loader
 batch_size = 20
-train_set = Data.TensorDataset(train_strain, train_stress)
+train_set = Data.TensorDataset(train_strain_encode, train_stress_encode)
 train_loader = Data.DataLoader(train_set, batch_size, shuffle=True)
 
 ############################# Define and train network #############################
-# Create Nueral network, define loss function and optimizer
+# Create Neural network, define loss function and optimizer
 net = Const_Net(input_dim=ndim, hidden_dim=64, output_dim=ndim)
 
 n_params = sum(p.numel() for p in net.parameters() if p.requires_grad) #Calculate the number of training parameters
 print('Number of parameters: %d' % n_params)
 
 loss_func = Lossfunc() # define loss function
-optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)  # define optimizer with learning rate 0.001
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)  # decrease LR by half every 20 epochs
+optimizer = torch.optim.Adam(net.parameters(), lr=3e-2)  # define optimizer with learning rate 0.001
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5)  # decrease LR by half every 20 epochs
 
 # Train network
-epochs = 100  # define number of training epochs
+epochs = 200  # define number of training epochs
 print("Start training for {} epochs...".format(epochs))
 
 loss_train_list = []
 loss_test_list = []
 
-# (Assuming you have already defined train_loader and test_loader)
 for epoch in range(epochs):
     net.train(True)
+
     trainloss = 0.0
     for i, data in enumerate(train_loader):
         input, target = data
-        # batch_size, nstep, input_dim = inputs.shape
-
-        #define forward neural network evaluation below
+        # Forward pass
         output = net(input)
         loss = loss_func(output, target)
 
@@ -203,33 +199,51 @@ for epoch in range(epochs):
         loss.backward()
         optimizer.step()
         scheduler.step()  # update learning rate if required per batch
-        
+
         # Accumulate the training loss
         trainloss += loss.item()
+    # ipdb.set_trace()
     trainloss /= len(train_loader)
 
-    # Compute test loss
+    # Compute test loss using the normalized test data
     net.eval()
-    testloss = 0.0
     with torch.no_grad():
-        output_test = net(test_strain_encode)
-        testloss = loss_func(output_test, test_stress_encode)
+        test_input = test_strain_encode  # normalized test strain data
+        test_target = test_stress_encode  # normalized test stress data
+        output_test = net(test_input)
+        testloss = loss_func(output_test, test_target).item()
 
     # Print train loss every 10 epochs
     if epoch % 10 == 0:
         print("epoch: {}, train loss: {:.4f}, test loss: {:.4f}".format(epoch,
-                                                                         trainloss / len(train_loader),
+                                                                         trainloss,
                                                                          testloss))
-    # Save loss values for plotting later
-    loss_train_list.append(trainloss / len(train_loader))
+    # Save loss values for plotting and logging
+    loss_train_list.append(trainloss)
     loss_test_list.append(testloss)
 
-print("Final Train loss: {:.4f}".format(trainloss / len(train_loader)))
+print("Final Train loss: {:.4f}".format(trainloss))
 print("Final Test loss: {:.4f}".format(testloss))
 
-############################# Plot your result below using Matplotlib #############################
-plt.figure(1)
-plt.title('Train and Test Losses')
+############################# Log training history to a YAML file #############################
+history = {
+    'epochs': epochs,
+    'train_loss': loss_train_list,
+    'test_loss': loss_test_list
+}
 
-plt.figure(2)
-plt.title('Truth Stresses vs Approximate Stresses for Sample {}')
+with open('./Problem_1_student/training_history.yaml', 'w') as f:
+    yaml.dump(history, f)
+print("Training history has been logged to training_history.yaml")
+
+############################# Plot your results using Matplotlib #############################
+plt.figure(figsize=(8, 5))
+plt.plot(range(epochs), loss_train_list, label='Train Loss')
+plt.plot(range(epochs), loss_test_list, label='Test Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Train vs Test Loss')
+plt.legend()
+plt.grid(True)
+plt.savefig('./Problem_1_student/train_vs_test_loss.png')  # Save the figure as a PNG file
+plt.close()  # Close the figure to free up memory
