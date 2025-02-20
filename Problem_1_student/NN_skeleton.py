@@ -99,18 +99,19 @@ class Const_Net(nn.Module):
 
 ######################### Experiment Loop #########################
 # List of material files (assumed to be in Problem_1_student/Data/)
-# material_files = ['Material_A.mat', 'Material_B.mat', 'Material_C.mat']
-material_files = ['Material_C.mat']
+material_files = ['Material_A.mat', 'Material_B.mat', 'Material_C.mat']
+# material_files = ['Material_C.mat']
 
 # Hyperparameters (you can experiment with these and comment in your report)
-learning_rate = 3e-4
-hidden_dim = 64
-epochs = 200
+learning_rate = 1e-4
+hidden_dim = 128
+epochs = 100
+sche_step_size = 20
 batch_size = 20
 
 # Base folders for data and results
 data_folder = 'Problem_1_student/Data'
-results_base = 'Problem_1_student/results'
+results_base = 'Problem_1_student/results/OutputC'
 os.makedirs(results_base, exist_ok=True)
 
 for material_file in material_files:
@@ -156,13 +157,13 @@ for material_file in material_files:
     train_loader = Data.DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
     # Initialize the network, loss function, optimizer, and scheduler
-    net = Const_Net(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim)
+    net = Const_Net(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim**2)
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"Number of parameters for {material_name}: {n_params}")
 
     loss_func = Lossfunc()
     optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=sche_step_size, gamma=0.5)
 
     loss_train_list = []
     loss_test_list = []
@@ -174,12 +175,18 @@ for material_file in material_files:
         for i, data in enumerate(train_loader):
             inputs, targets = data
             output = net(inputs)
-            loss = loss_func(output, targets)
+
+            # ipdb.set_trace()
+            C_tensor = output.view(output.shape[0], output.shape[1], ndim, ndim)
+            stress = inputs.unsqueeze(-1)
+            predicts = torch.matmul(C_tensor, stress).squeeze(-1)
+        
+            loss = loss_func(predicts, targets)
+
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            scheduler.step()  # update learning rate per batch
 
             trainloss += loss.item()
         trainloss /= len(train_loader)
@@ -189,10 +196,16 @@ for material_file in material_files:
         net.eval()
         with torch.no_grad():
             output_test = net(test_strain_encode)
-            testloss = loss_func(output_test, test_stress_encode).item()
+            
+            C_tensor_test = output_test.view(output_test.shape[0], output_test.shape[1], ndim, ndim)
+            stress_test = test_strain_encode.unsqueeze(-1)
+            predicts_test = torch.matmul(C_tensor_test, stress_test).squeeze(-1)
+        
+            testloss = loss_func(predicts_test, test_stress_encode).item()
         loss_test_list.append(testloss)
 
-        if epoch % 10 == 0:
+        scheduler.step()  # update learning rate per batch
+        if epoch % 1 == 0:
             print(f"{material_name} - epoch: {epoch}, train loss: {trainloss:.4f}, test loss: {testloss:.4f}")
 
     print(f"{material_name} - Final Train loss: {trainloss:.4f}")
@@ -235,6 +248,11 @@ for material_file in material_files:
         sample_input = test_strain_encode[0:1]
         sample_target = test_stress_encode[0:1]
         sample_output = net(sample_input)
+        sample_C = sample_output.view(sample_output.shape[0], sample_output.shape[1], ndim, ndim)
+        stress_test = sample_input.unsqueeze(-1)
+        sample_predict_stress = torch.matmul(sample_C, sample_input.unsqueeze(-1)).squeeze(-1)
+
+
     time_steps = np.linspace(0, dt*(nstep-1), nstep)
     plt.figure(figsize=(8, 5))
 
@@ -247,7 +265,7 @@ for material_file in material_files:
         plt.plot(time_steps, sample_target[0, :, comp].cpu().numpy(), 
                 label=f'Truth Stress comp {comp}', color=color)
         # Plot predicted stress in dashed line using the same color
-        plt.plot(time_steps, sample_output[0, :, comp].cpu().numpy(), '--', 
+        plt.plot(time_steps, sample_predict_stress[0, :, comp].cpu().numpy(), '--', 
                 label=f'Predicted Stress comp {comp}', color=color)
 
     plt.xlabel('Time')
@@ -259,5 +277,31 @@ for material_file in material_files:
     plt.savefig(sample_plot_file)
     plt.close()
     print(f"Stress comparison plot saved to {sample_plot_file}")
+
+
+
+
+    plt.figure(figsize=(8, 5))
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    for comp in range(ndim):
+        color = colors[comp % len(colors)]
+        # Plot true stress vs true strain with a solid line
+        plt.plot(sample_input[0, :, comp].cpu().numpy(), 
+                sample_target[0, :, comp].cpu().numpy(), 
+                label=f'Truth Stress vs Strain comp {comp}', color=color)
+        # Plot predicted stress vs strain with a dashed line using the same color
+        # plt.plot(sample_input[0, :, comp].cpu().numpy(), 
+        #         sample_predict_stress[0, :, comp].cpu().numpy(), '--', 
+        #         label=f'Predicted Stress vs Strain comp {comp}', color=color)
+
+    plt.xlabel('Strain')
+    plt.ylabel('Stress')
+    plt.title(f'{material_name}: True Stress vs Strain (Sample 0)')
+    # plt.legend()
+    plt.grid(True)
+    fig_file = os.path.join(result_folder, 'stress_vs_strain_sample.png')
+    plt.savefig(fig_file)
+    plt.close()
+    print(f"Stress vs strain plot saved to {fig_file}")
 
 print("All experiments completed.")
