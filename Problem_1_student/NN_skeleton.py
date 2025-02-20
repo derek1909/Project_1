@@ -99,13 +99,13 @@ class Const_Net(nn.Module):
 
 ######################### Experiment Loop #########################
 # List of material files (assumed to be in Problem_1_student/Data/)
-# material_files = ['Material_A.mat', 'Material_B.mat', 'Material_C.mat']
-material_files = ['Material_C.mat']
+material_files = ['Material_A.mat', 'Material_B.mat', 'Material_C.mat']
+# material_files = ['Material_C.mat']
 
 # Hyperparameters (you can experiment with these and comment in your report)
-learning_rate = 3e-4
+learning_rate = 3e-5
 hidden_dim = 64
-epochs = 200
+epochs = 300
 batch_size = 20
 
 # Base folders for data and results
@@ -162,7 +162,7 @@ for material_file in material_files:
 
     loss_func = Lossfunc()
     optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
 
     loss_train_list = []
     loss_test_list = []
@@ -179,7 +179,6 @@ for material_file in material_files:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            scheduler.step()  # update learning rate per batch
 
             trainloss += loss.item()
         trainloss /= len(train_loader)
@@ -191,6 +190,7 @@ for material_file in material_files:
             output_test = net(test_strain_encode)
             testloss = loss_func(output_test, test_stress_encode).item()
         loss_test_list.append(testloss)
+        scheduler.step()  # update learning rate per batch
 
         if epoch % 10 == 0:
             print(f"{material_name} - epoch: {epoch}, train loss: {trainloss:.4f}, test loss: {testloss:.4f}")
