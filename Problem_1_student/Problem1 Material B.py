@@ -8,7 +8,7 @@ import h5py
 import yaml
 import wandb  # Import wandb
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 # Initialize wandb run
@@ -16,11 +16,12 @@ wandb.init(
     project="Material_B",
     config={
         "learning_rate": 3e-5,
-        "hidden_dim": 256,
+        "hidden_dim": 128,
         "epochs": 500,
         "batch_size": 100,
         "sche_step_size": 100,
-        "model": "RNN"
+        "hidden_layer": 4,
+        "model": "FCNN"
     }
 )
 config = wandb.config
@@ -33,27 +34,6 @@ class Lossfunc(object):
 
     def __call__(self, pred_stress, target_stress):
         return self.mse_loss(pred_stress, target_stress)
-
-# Temporal Loss Function
-class TemporalLossFunc(object):
-    def __init__(self):
-        # We'll use the MSE loss for each time step.
-        self.mse_loss = nn.MSELoss(reduction='mean')
-
-    def __call__(self, pred_stress, target_stress):
-        """
-        Compute the loss as the average MSE over all time steps.
-        Both pred_stress and target_stress should have shape [batch, T, output_dim].
-        """
-        T = pred_stress.shape[1]
-        total_loss = 0.0
-        for t in range(T):
-            # Compute loss for time step t
-            loss_t = self.mse_loss(pred_stress[:, t, :], target_stress[:, t, :])
-            total_loss += loss_t
-        # Average loss over time steps
-        return total_loss / T
-
 
 # This reads the matlab data from the .mat file provided
 class MatRead(object):
@@ -87,32 +67,28 @@ class DataNormalizer(object):
 
 # Define the neural network for the constitutive model
 class FCNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64, output_dim=None):
+    def __init__(self, input_dim, hidden_dim=64, output_dim=None, num_layers=4):
         """
         Args:
             input_dim (int): Number of input features (ndim).
             hidden_dim (int): Size of the hidden layers.
             output_dim (int, optional): Number of output features.
                                         If None, set equal to input_dim.
+            num_layers (int): Number of linear layers in the network.
         """
         super(FCNN, self).__init__()
         if output_dim is None:
             output_dim = input_dim
 
-        # Encoder: maps the input strain to a latent representation
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
 
-        # Decoder: maps the latent representation to predicted stress
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.model = nn.Sequential(*layers)
 
     def forward(self, x):
         """
@@ -127,12 +103,9 @@ class FCNN(nn.Module):
         batch_size, nstep, input_dim = x.shape
         # Flatten the time dimension with the batch dimension so that each time step is processed individually.
         x_flat = x.view(batch_size * nstep, input_dim)
-        # Encode the flattened input
-        encoded = self.encoder(x_flat)
-        # Decode the latent representation
-        decoded = self.decoder(encoded)
+        output = self.model(x_flat)
         # Reshape back to (batch_size, nstep, output_dim)
-        out = decoded.view(batch_size, nstep, -1)
+        out = output.view(batch_size, nstep, -1)
         return out
 
 # RNN Architecture for Constitutive Modeling
@@ -197,6 +170,7 @@ hidden_dim = config.hidden_dim
 epochs = config.epochs
 batch_size = config.batch_size
 sche_step_size = config.sche_step_size
+hidden_layer = config.hidden_layer
 data_folder = 'Problem_1_student/Data'
 results_base = 'Problem_1_student/results/RNNOutputStress'
 os.makedirs(results_base, exist_ok=True)
@@ -246,7 +220,7 @@ for material_file in material_files:
     if config.model == "RNN":
         net = RNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim).to(device)
     elif config.model == "FCNN":
-        net = FCNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim).to(device)
+        net = FCNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim, num_layers=hidden_layer).to(device)
     else:
         raise ValueError(f"Unknown model type specified in config: {config.model}")
 
