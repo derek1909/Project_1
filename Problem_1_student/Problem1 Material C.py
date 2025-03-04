@@ -5,12 +5,26 @@ import torch.nn as nn
 import torch.utils.data as Data
 import numpy as np
 import h5py
-import ipdb
-import yaml  # For logging training history to a YAML file
+import yaml
+import wandb  # Import wandb
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# device = torch.device("cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
+
+# Initialize wandb run
+wandb.init(
+    project="Material_C",
+    config={
+        "learning_rate": 3e-5,
+        "hidden_dim": 128,
+        "epochs": 500,
+        "batch_size": 100,
+        "sche_step_size": 100,
+        "hidden_layer": 4,
+        "model": "FCNN"
+    }
+)
+config = wandb.config
 
 ######################### Utility Classes #########################
 # Loss function using MSE of stress
@@ -73,33 +87,42 @@ class DataNormalizer(object):
         return data_normalized * self.std + self.mean
 
 # Define the neural network for the constitutive model
-class Const_Net(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64, output_dim=None):
+class FCNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, output_dim=None,
+                 encoder_num_layers=2, decoder_num_layers=2):
         """
         Args:
             input_dim (int): Number of input features (ndim).
             hidden_dim (int): Size of the hidden layers.
             output_dim (int, optional): Number of output features.
                                         If None, set equal to input_dim.
+            encoder_num_layers (int): Number of linear layers in the encoder.
+            decoder_num_layers (int): Number of linear layers in the decoder.
         """
-        super(Const_Net, self).__init__()
+        super(FCNN, self).__init__()
         if output_dim is None:
             output_dim = input_dim
 
-        # Encoder: maps the input strain to a latent representation
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
+        # Build encoder: maps the input strain to a latent representation
+        encoder_layers = []
+        # First encoder layer: from input_dim to hidden_dim
+        encoder_layers.append(nn.Linear(input_dim, hidden_dim))
+        encoder_layers.append(nn.ReLU())
+        # Additional encoder layers (if any)
+        for _ in range(encoder_num_layers - 1):
+            encoder_layers.append(nn.Linear(hidden_dim, hidden_dim))
+            encoder_layers.append(nn.ReLU())
+        self.encoder = nn.Sequential(*encoder_layers)
 
-        # Decoder: maps the latent representation to predicted stress
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
+        # Build decoder: maps the latent representation to predicted stress
+        decoder_layers = []
+        # Hidden decoder layers
+        for _ in range(decoder_num_layers - 1):
+            decoder_layers.append(nn.Linear(hidden_dim, hidden_dim))
+            decoder_layers.append(nn.ReLU())
+        # Final decoder layer: from hidden_dim to output_dim
+        decoder_layers.append(nn.Linear(hidden_dim, output_dim))
+        self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, x):
         """
@@ -123,7 +146,7 @@ class Const_Net(nn.Module):
         return out
 
 # RNN Architecture for Constitutive Modeling
-class Const_RNN(nn.Module):
+class RNN(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, output_dim=None):
         """
         Args:
@@ -131,7 +154,7 @@ class Const_RNN(nn.Module):
             hidden_dim: Dimension of the hidden state (represents the memory capacity).
             output_dim: Dimension of the output (e.g., number of stress components).
         """
-        super(Const_RNN, self).__init__()
+        super(RNN, self).__init__()
         self.hidden_dim = hidden_dim
         
         # f: Function to update the hidden state.
@@ -150,7 +173,6 @@ class Const_RNN(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, output_dim)
         )
-
 
     def forward(self, x):
         """
@@ -179,37 +201,31 @@ class Const_RNN(nn.Module):
         return outputs
     
 ######################### Experiment Loop #########################
-# List of material files (assumed to be in Problem_1_student/Data/)
-# material_files = ['Material_A.mat', 'Material_B.mat', 'Material_C.mat']
 material_files = ['Material_C.mat']
-
-# Hyperparameters (you can experiment with these and comment in your report)
-learning_rate = 3e-4
-hidden_dim = 256
-epochs = 500
-sche_step_size = 125
-batch_size = 50
-
-# Base folders for data and results
+learning_rate = config.learning_rate
+hidden_dim = config.hidden_dim
+epochs = config.epochs
+batch_size = config.batch_size
+sche_step_size = config.sche_step_size
+hidden_layer = config.hidden_layer
 data_folder = 'Problem_1_student/Data'
 results_base = 'Problem_1_student/results/RNNOutputStress'
 os.makedirs(results_base, exist_ok=True)
 
 for material_file in material_files:
-    material_name = os.path.splitext(material_file)[0]  # e.g., "Material_A"
+    material_name = os.path.splitext(material_file)[0]
     print(f"Processing {material_name}...")
 
-    # Create a folder for saving results for this material
     result_folder = os.path.join(results_base, material_name)
     os.makedirs(result_folder, exist_ok=True)
 
-    # Read the data for the current material
+    # Read data
     path = os.path.join(data_folder, material_file)
     data_reader = MatRead(path)
     strain = data_reader.get_strain()
     stress = data_reader.get_stress()
 
-    # Shuffle and split into training and test sets (80/20 split)
+    # Shuffle and split into training and test sets
     n_samples = strain.shape[0]
     perm = torch.randperm(n_samples)
     strain = strain[perm]
@@ -229,31 +245,39 @@ for material_file in material_files:
     train_stress_encode = stress_normalizer.transform(train_stress)
     test_stress_encode = stress_normalizer.transform(test_stress)
 
-    ndim = strain.shape[2]  # Number of components
-    nstep = strain.shape[1] # Number of time steps
+    ndim = strain.shape[2]
+    nstep = strain.shape[1]
     dt = 1 / (nstep - 1)
 
     # Create DataLoader for training data
     train_set = Data.TensorDataset(train_strain_encode, train_stress_encode)
     train_loader = Data.DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
-    # Initialize the network, loss function, optimizer, and scheduler
-    # net = Const_RNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim)
-    net = Const_RNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim).to(device)  
-    n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print(f"Number of parameters for {material_name}: {n_params}")
+    # Initialize the network based on the wandb config parameter "model"
+    if config.model == "RNN":
+        net = RNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim).to(device)
+    elif config.model == "FCNN":
+        net = FCNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim).to(device)
+        net = FCNN(input_dim=ndim, hidden_dim=hidden_dim, output_dim=ndim, num_layers=hidden_layer).to(device)
+    else:
+        raise ValueError(f"Unknown model type specified in config: {config.model}")
 
-    # loss_func = TemporalLossFunc()
+    n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print(f"Number of parameters for {material_name}, {config.model}: {n_params}")
+
     loss_func = Lossfunc()
     optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=sche_step_size, gamma=0.5)
+
+    # Watch the model with wandb to log gradients and parameters
+    wandb.watch(net, log="all", log_freq=100)
 
     loss_train_list = []
     loss_test_list = []
 
     # Training loop
     for epoch in range(epochs):
-        net.train(True)
+        net.train()
         trainloss = 0.0
         for i, data in enumerate(train_loader):
             inputs, targets = data
@@ -265,7 +289,6 @@ for material_file in material_files:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             trainloss += loss.item()
         trainloss /= len(train_loader)
         loss_train_list.append(trainloss)
@@ -278,7 +301,14 @@ for material_file in material_files:
             output_test = net(test_strain_encode)
             testloss = loss_func(output_test, test_stress_encode).item()
         loss_test_list.append(testloss)
-        scheduler.step()  # update learning rate per batch
+        scheduler.step()
+
+        # Log metrics to wandb
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": trainloss,
+            "test_loss": testloss
+        })
 
         if epoch % 10 == 0:
             print(f"{material_name} - epoch: {epoch}, train loss: {trainloss:.4f}, test loss: {testloss:.4f}")
@@ -302,7 +332,7 @@ for material_file in material_files:
         yaml.dump(history, f)
     print(f"Training history logged to {history_file}")
 
-    # Plot and save train vs test loss curve
+    # Plot and save loss curve
     plt.figure(figsize=(8, 5))
     plt.plot(range(epochs), loss_train_list, label='Train Loss')
     plt.plot(range(epochs), loss_test_list, label='Test Loss')
@@ -315,31 +345,23 @@ for material_file in material_files:
     plt.savefig(loss_plot_file)
     plt.close()
     print(f"Loss plot saved to {loss_plot_file}")
+    
+    # Log loss plot image to wandb
+    wandb.log({"loss_plot": wandb.Image(loss_plot_file)})
 
     # Plot one sample of truth stress vs predicted stress
     net.eval()
     with torch.no_grad():
-        # Use the first sample from the test set
-        sample_input = test_strain_encode[0:1]
-        sample_target = test_stress_encode[0:1]
-        sample_input = sample_input.to(device)  # Ensure sample is on GPU for inference
-        sample_output = net(sample_input)
-        sample_output = sample_output.cpu().numpy()
+        sample_input = test_strain_encode[0:1].to(device)
+        sample_target = test_stress_encode[0:1].to(device)
+        sample_output = net(sample_input).cpu().numpy()
     time_steps = np.linspace(0, dt*(nstep-1), nstep)
     plt.figure(figsize=(8, 5))
-
-    # Retrieve default color cycle from matplotlib
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-
     for comp in range(ndim):
         color = colors[comp % len(colors)]
-        # Plot truth stress in solid line
-        plt.plot(time_steps, sample_target[0, :, comp].cpu().numpy(), 
-                label=f'Truth Stress comp {comp}', color=color)
-        # Plot predicted stress in dashed line using the same color
-        plt.plot(time_steps, sample_output[0, :, comp], '--', 
-                label=f'Predicted Stress comp {comp}', color=color)
-
+        plt.plot(time_steps, sample_target[0, :, comp].cpu().numpy(), label=f'Truth Stress comp {comp}', color=color)
+        plt.plot(time_steps, sample_output[0, :, comp], '--', label=f'Predicted Stress comp {comp}', color=color)
     plt.xlabel('Time')
     plt.ylabel('Stress')
     plt.title(f'{material_name}: Stress Comparison (Sample 0)')
@@ -350,28 +372,25 @@ for material_file in material_files:
     plt.close()
     print(f"Stress comparison plot saved to {sample_plot_file}")
 
+    # Log stress comparison plot image to wandb
+    wandb.log({"stress_comparison_plot": wandb.Image(sample_plot_file)})
 
     plt.figure(figsize=(8, 5))
-    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     for comp in range(ndim):
-        color = colors[comp % len(colors)]
-        # Plot true stress vs true strain with a solid line
-        plt.plot(sample_input[0, :, comp].cpu().numpy(), 
-                sample_target[0, :, comp].cpu().numpy(), 
-                label=f'Truth Stress vs Strain comp {comp}', color=color)
-        # Plot predicted stress vs strain with a dashed line using the same color
-        # plt.plot(sample_input[0, :, comp].cpu().numpy(), 
-        #         sample_predict_stress[0, :, comp].cpu().numpy(), '--', 
-        #         label=f'Predicted Stress vs Strain comp {comp}', color=color)
-
+        plt.plot(sample_input[0, :, comp].cpu().numpy(), sample_target[0, :, comp].cpu().numpy(), label=f'Stress vs Strain comp {comp}')
     plt.xlabel('Strain')
     plt.ylabel('Stress')
     plt.title(f'{material_name}: True Stress vs Strain (Sample 0)')
-    # plt.legend()
     plt.grid(True)
     fig_file = os.path.join(result_folder, 'stress_vs_strain_sample.png')
     plt.savefig(fig_file)
     plt.close()
     print(f"Stress vs strain plot saved to {fig_file}")
+    
+    # Optionally, log the stress vs strain plot to wandb
+    wandb.log({"stress_vs_strain_plot": wandb.Image(fig_file)})
 
 print("All experiments completed.")
+
+# Finish the wandb run
+wandb.finish()
