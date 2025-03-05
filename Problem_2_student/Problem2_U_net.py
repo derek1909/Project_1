@@ -8,7 +8,7 @@ import h5py
 import ipdb
 import yaml  # For logging training history to a YAML file
 
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 ######################### Utility Classes #########################
@@ -23,8 +23,7 @@ class Lossfunc(object):
 # This reads the matlab data from the .mat file provided
 class MatRead(object):
     def __init__(self, file_path):
-        super(MatRead).__init__()
-
+        super(MatRead, self).__init__()
         self.file_path = file_path
         self.data = h5py.File(self.file_path)
 
@@ -50,61 +49,88 @@ class DataNormalizer(object):
     def inverse_transform(self, data_normalized):
         return data_normalized * self.std + self.mean
 
-# Define the classifier neural network
-class Classifier_Net(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64):
-        """
-        Args:
-            input_dim (int): Number of input features (in our case, 20 load points).
-            hidden_dim (int): Number of hidden units.
-        """
-        super(Classifier_Net, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)  # output a single logit for binary classification
+######################### U-Net for 1D Data #########################
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DoubleConv, self).__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
         )
-
     def forward(self, x):
-        """
-        Forward pass through the network.
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, 20, 1)
-        
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, 1)
-        """
-        # Flatten the 20 load points into a vector of size 20
-        x_flat = x.view(x.size(0), -1)
-        return self.model(x_flat)
+        return self.double_conv(x)
+
+class UNet1D(nn.Module):
+    def __init__(self, in_channels=1, features=[64, 128]):
+        super(UNet1D, self).__init__()
+        self.downs = nn.ModuleList()
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
+        # Encoder path
+        for feature in features:
+            self.downs.append(DoubleConv(in_channels, feature))
+            in_channels = feature
+        self.bottleneck = DoubleConv(features[-1], features[-1]*2)
+        # Decoder path
+        self.ups = nn.ModuleList()
+        rev_features = features[::-1]
+        for feature in rev_features:
+            self.ups.append(nn.ConvTranspose1d(feature*2, feature, kernel_size=2, stride=2))
+            self.ups.append(DoubleConv(feature*2, feature))
+    def forward(self, x):
+        skip_connections = []
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]
+        for idx in range(0, len(self.ups), 2):
+            x = self.ups[idx](x)
+            skip_connection = skip_connections[idx//2]
+
+            if x.shape[-1] != skip_connection.shape[-1]:
+                x = nn.functional.pad(x, (0, skip_connection.shape[-1] - x.shape[-1]))
+            x = torch.cat([skip_connection, x], dim=1)
+            x = self.ups[idx+1](x)
+        return x
+
+class UNetClassifier(nn.Module):
+    def __init__(self, in_channels=1, features=[64, 128], num_classes=1):
+        super(UNetClassifier, self).__init__()
+        self.unet = UNet1D(in_channels, features)
+        # 使用全局平均池化将特征聚合，再接一个全连接层输出单个logit
+        self.classifier = nn.Linear(features[0], num_classes)
+    def forward(self, x):
+        # x: (batch, 1, length)
+        features = self.unet(x)   # 输出 shape: (batch, features[0], length)
+        gap = features.mean(dim=2)  # 全局平均池化, shape: (batch, features[0])
+        out = self.classifier(gap)  # shape: (batch, num_classes)
+        return out
 
 ######################### Experiment Loop #########################
 
 # Hyperparameters
-learning_rate = 3e-4
-hidden_dim = 256
+learning_rate = 1e-4
+feature_size = [64, 128]
 epochs = 500
-batch_size = 100
+batch_size = 1000
 
 # Create a folder for saving results
 data_folder = 'Problem_2_student/Data'
-results_folder = 'Problem_2_student/results/Classifier'
-material_file = 'Eiffel_data.mat'
+results_folder = 'Problem_2_student/results/U-Net'
+material_file = 'Eiffel_data2.mat'
 os.makedirs(results_folder, exist_ok=True)
 
 # Generate synthetic data:
 # 1000 samples, each with 20 load points (each point is 1-dimensional)
 path = os.path.join(data_folder, material_file)
 data_reader = MatRead(path)
-load = data_reader.get_load()
-labels = data_reader.get_labels()
+load = data_reader.get_load()    # shape: (1000, 20)
+labels = data_reader.get_labels()  # shape: (1000, 1)
 
-[num_samples, num_load_points] = load.shape # 1000 x 20
-print(load.shape)
-print(labels.shape)
+[num_samples, num_load_points] = load.shape
 
 # Shuffle and split into training and test sets (80/20 split)
 perm = torch.randperm(num_samples)
@@ -121,15 +147,18 @@ load_normalizer = DataNormalizer(train_load)
 train_load_norm = load_normalizer.transform(train_load)
 test_load_norm = load_normalizer.transform(test_load)
 
+# Add a channel dimension for UNetClassifier (batch, channel, length)
+train_load_norm = train_load_norm.unsqueeze(1)  # (ntrain, 1, 20)
+test_load_norm = test_load_norm.unsqueeze(1)    # (num_test, 1, 20)
+
 # Create DataLoader for training data
 train_set = Data.TensorDataset(train_load_norm, train_labels)
 train_loader = Data.DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
-# Initialize the classifier network, loss function, optimizer, and (optional) scheduler
-# The input dimension is 20 (load points flattened)
-net = Classifier_Net(input_dim=num_load_points, hidden_dim=hidden_dim).to(device)
+# Initialize the U-Net based classifier network, loss function, optimizer, and scheduler
+net = UNetClassifier(in_channels=1, features=feature_size, num_classes=1).to(device)
 n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-print(f"Number of parameters in the classifier: {n_params}")
+print(f"Number of parameters in the U-Net: {n_params}")
 
 loss_func = Lossfunc()
 optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)
@@ -177,7 +206,7 @@ history = {
     'test_loss': loss_test_list,
     'hyperparameters': {
         'learning_rate': learning_rate,
-        'hidden_dim': hidden_dim,
+        'features': feature_size,
         'batch_size': batch_size
     }
 }
@@ -200,19 +229,11 @@ plt.savefig(loss_plot_file)
 plt.close()
 print(f"Loss plot saved to {loss_plot_file}")
 
-# Evaluate test accuracy
-net.eval()
-with torch.no_grad():
-    test_preds = net(test_load_norm.to(device))
-    # Apply sigmoid to convert logits to probabilities, then threshold at 0.5
-    predicted_labels = (torch.sigmoid(test_preds) > 0.5).float()
-    accuracy = (predicted_labels.cpu() == test_labels.cpu()).float().mean().item()
-
 # Evaluate test accuracy and return wrong trial indices
 net.eval()
 with torch.no_grad():
     test_preds = net(test_load_norm.to(device))
-    # Apply sigmoid and threshold to get predicted labels
+    # Apply sigmoid to convert logits to probabilities, then threshold at 0.5
     predicted_labels = (torch.sigmoid(test_preds) > 0.5).float()
     accuracy = (predicted_labels.cpu() == test_labels.cpu()).float().mean().item()
     # Find indices where predicted labels do not match true labels
@@ -224,7 +245,7 @@ print(f"Test Accuracy: {accuracy*100:.2f}%")
 with torch.no_grad():
     test_probs = torch.sigmoid(test_preds).cpu().numpy().flatten()
     true_labels = test_labels.cpu().numpy().flatten()
-plt.figure(figsize=(8, 5))
+plt.figure(figsize=(5, 5))
 plt.scatter(range(len(test_probs)), test_probs, label='Predicted Probability', color='b', alpha=0.6)
 plt.scatter(range(len(true_labels)), true_labels, label='True Label', color='r', marker='x')
 plt.xlabel('Test Sample Index')

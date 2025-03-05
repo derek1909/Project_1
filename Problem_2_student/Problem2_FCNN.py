@@ -64,6 +64,8 @@ class Classifier_Net(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 1)  # output a single logit for binary classification
         )
 
@@ -85,14 +87,14 @@ class Classifier_Net(nn.Module):
 
 # Hyperparameters
 learning_rate = 3e-4
-hidden_dim = 256
+hidden_dim = 128
 epochs = 500
-batch_size = 100
+batch_size = 1000
 
 # Create a folder for saving results
 data_folder = 'Problem_2_student/Data'
 results_folder = 'Problem_2_student/results/Classifier'
-material_file = 'Eiffel_data.mat'
+material_file = 'Eiffel_data2.mat'
 os.makedirs(results_folder, exist_ok=True)
 
 # Generate synthetic data:
@@ -103,8 +105,6 @@ load = data_reader.get_load()
 labels = data_reader.get_labels()
 
 [num_samples, num_load_points] = load.shape # 1000 x 20
-print(load.shape)
-print(labels.shape)
 
 # Shuffle and split into training and test sets (80/20 split)
 perm = torch.randperm(num_samples)
@@ -129,7 +129,7 @@ train_loader = Data.DataLoader(train_set, batch_size=batch_size, shuffle=True)
 # The input dimension is 20 (load points flattened)
 net = Classifier_Net(input_dim=num_load_points, hidden_dim=hidden_dim).to(device)
 n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-print(f"Number of parameters in the classifier: {n_params}")
+print(f"Number of parameters in the FCNN classifier: {n_params}")
 
 loss_func = Lossfunc()
 optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)
@@ -200,14 +200,6 @@ plt.savefig(loss_plot_file)
 plt.close()
 print(f"Loss plot saved to {loss_plot_file}")
 
-# Evaluate test accuracy
-net.eval()
-with torch.no_grad():
-    test_preds = net(test_load_norm.to(device))
-    # Apply sigmoid to convert logits to probabilities, then threshold at 0.5
-    predicted_labels = (torch.sigmoid(test_preds) > 0.5).float()
-    accuracy = (predicted_labels.cpu() == test_labels.cpu()).float().mean().item()
-
 # Evaluate test accuracy and return wrong trial indices
 net.eval()
 with torch.no_grad():
@@ -224,7 +216,7 @@ print(f"Test Accuracy: {accuracy*100:.2f}%")
 with torch.no_grad():
     test_probs = torch.sigmoid(test_preds).cpu().numpy().flatten()
     true_labels = test_labels.cpu().numpy().flatten()
-plt.figure(figsize=(8, 5))
+plt.figure(figsize=(5, 5))
 plt.scatter(range(len(test_probs)), test_probs, label='Predicted Probability', color='b', alpha=0.6)
 plt.scatter(range(len(true_labels)), true_labels, label='True Label', color='r', marker='x')
 plt.xlabel('Test Sample Index')

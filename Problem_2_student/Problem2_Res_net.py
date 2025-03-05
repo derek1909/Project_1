@@ -3,10 +3,14 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.utils.data as Data
+import torchvision.models as models
+import os
 import numpy as np
 import h5py
 import ipdb
-import yaml  # For logging training history to a YAML file
+import yaml
+
+# Define the ResNet-based classifier
 
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -50,7 +54,6 @@ class DataNormalizer(object):
     def inverse_transform(self, data_normalized):
         return data_normalized * self.std + self.mean
 
-# Define the classifier neural network
 class Classifier_Net(nn.Module):
     def __init__(self, input_dim, hidden_dim=64):
         """
@@ -59,17 +62,15 @@ class Classifier_Net(nn.Module):
             hidden_dim (int): Number of hidden units.
         """
         super(Classifier_Net, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)  # output a single logit for binary classification
-        )
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, 1)  # output a single logit for binary classification
+        self.relu = nn.ReLU()
 
     def forward(self, x):
         """
-        Forward pass through the network.
+        Forward pass through the network with a residual connection.
         
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, 20, 1)
@@ -79,32 +80,35 @@ class Classifier_Net(nn.Module):
         """
         # Flatten the 20 load points into a vector of size 20
         x_flat = x.view(x.size(0), -1)
-        return self.model(x_flat)
+        
+        out1 = self.relu(self.fc1(x_flat))
+        out2 = self.relu(self.fc2(out1))
+        out2 = out2 + out1 # Add the residual connection
 
-######################### Experiment Loop #########################
+        out3 = self.relu(self.fc3(out2))
+        out3 = out3 + out2 # Add the residual connection
+        out4 = self.fc4(out3)
+        return out4
 
 # Hyperparameters
 learning_rate = 3e-4
-hidden_dim = 256
+hidden_dim = 128
 epochs = 500
-batch_size = 100
+batch_size = 1000
 
 # Create a folder for saving results
 data_folder = 'Problem_2_student/Data'
-results_folder = 'Problem_2_student/results/Classifier'
-material_file = 'Eiffel_data.mat'
+results_folder = 'Problem_2_student/results/ResNet'
+material_file = 'Eiffel_data2.mat'
 os.makedirs(results_folder, exist_ok=True)
 
-# Generate synthetic data:
-# 1000 samples, each with 20 load points (each point is 1-dimensional)
+# Load dataset
 path = os.path.join(data_folder, material_file)
 data_reader = MatRead(path)
 load = data_reader.get_load()
 labels = data_reader.get_labels()
 
-[num_samples, num_load_points] = load.shape # 1000 x 20
-print(load.shape)
-print(labels.shape)
+num_samples, num_load_points = load.shape
 
 # Shuffle and split into training and test sets (80/20 split)
 perm = torch.randperm(num_samples)
@@ -125,12 +129,12 @@ test_load_norm = load_normalizer.transform(test_load)
 train_set = Data.TensorDataset(train_load_norm, train_labels)
 train_loader = Data.DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
-# Initialize the classifier network, loss function, optimizer, and (optional) scheduler
-# The input dimension is 20 (load points flattened)
+# Initialize the model
 net = Classifier_Net(input_dim=num_load_points, hidden_dim=hidden_dim).to(device)
 n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-print(f"Number of parameters in the classifier: {n_params}")
+print(f"Number of parameters in ResNet: {n_params}")
 
+# Loss and optimizer
 loss_func = Lossfunc()
 optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=125, gamma=0.5)
@@ -144,7 +148,7 @@ for epoch in range(epochs):
     train_loss = 0.0
     for batch_load, batch_labels in train_loader:
         batch_load = batch_load.to(device)
-        batch_labels = batch_labels.to(device)
+        batch_labels = batch_labels.to(device) # (batch_size, 20)
         preds = net(batch_load)
         loss = loss_func(preds, batch_labels)
         optimizer.zero_grad()
@@ -177,7 +181,6 @@ history = {
     'test_loss': loss_test_list,
     'hyperparameters': {
         'learning_rate': learning_rate,
-        'hidden_dim': hidden_dim,
         'batch_size': batch_size
     }
 }
@@ -224,7 +227,7 @@ print(f"Test Accuracy: {accuracy*100:.2f}%")
 with torch.no_grad():
     test_probs = torch.sigmoid(test_preds).cpu().numpy().flatten()
     true_labels = test_labels.cpu().numpy().flatten()
-plt.figure(figsize=(8, 5))
+plt.figure(figsize=(5, 5))
 plt.scatter(range(len(test_probs)), test_probs, label='Predicted Probability', color='b', alpha=0.6)
 plt.scatter(range(len(true_labels)), true_labels, label='True Label', color='r', marker='x')
 plt.xlabel('Test Sample Index')
